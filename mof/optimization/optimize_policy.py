@@ -6,24 +6,31 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+from tensorflow import keras
 
 
 R = 8.3145
 CO2_MW_KG_PER_MOL = 44.01e-3
 N2_MW_KG_PER_MOL = 28.0134e-3
 
-FEATURE_COLS = [
+DECISION_COLS = [
     "tADS",
     "PL",
     "v0",
     "t_press",
     "t_depress",
+]
+
+GAS_STATE_COLS = [
+    "co2_mol_frac",
     "h2o_ppmv",
     "sox_ppmv",
     "nox_ppmv",
     "dust_mg_Nm3",
-    "co2_mol_frac",
+]
+
+FACTOR_COLS = [
     "capacity_factor",
     "affinity_factor_co2",
     "mtc_factor",
@@ -31,6 +38,7 @@ FEATURE_COLS = [
     "deactivation_index",
 ]
 
+FEATURE_COLS = DECISION_COLS + GAS_STATE_COLS + FACTOR_COLS
 TARGET_COLS = ["CO2_purity", "CO2_recovery"]
 
 DECISION_BOUNDS = {
@@ -40,14 +48,6 @@ DECISION_BOUNDS = {
     "t_press": (20.0, 70.0),
     "t_depress": (25.0, 75.0),
 }
-
-GAS_STATE_COLS = [
-    "co2_mol_frac",
-    "h2o_ppmv",
-    "sox_ppmv",
-    "nox_ppmv",
-    "dust_mg_Nm3",
-]
 
 
 def clip(value: float, low: float, high: float) -> float:
@@ -120,7 +120,12 @@ def compute_pretreatment_factors(
     }
 
 
-def compute_effective_feed_fractions(co2_mol_frac: float, h2o_ppmv: float, sox_ppmv: float, nox_ppmv: float) -> tuple[float, float]:
+def compute_effective_feed_fractions(
+    co2_mol_frac: float,
+    h2o_ppmv: float,
+    sox_ppmv: float,
+    nox_ppmv: float,
+) -> tuple[float, float]:
     co2_mol_frac = clip(co2_mol_frac, 0.15, 0.25)
     trace_mol_frac = h2o_ppmv * 1e-6 + sox_ppmv * 1e-6 + nox_ppmv * 1e-6
     n2_major = max(1.0 - co2_mol_frac - trace_mol_frac, 1e-8)
@@ -130,17 +135,34 @@ def compute_effective_feed_fractions(co2_mol_frac: float, h2o_ppmv: float, sox_p
     return y_co2, y_n2
 
 
-def build_feature_row(decision: dict[str, float], gas_state: dict[str, float]) -> dict[str, float]:
-    factors = compute_pretreatment_factors(
-        gas_state["h2o_ppmv"],
-        gas_state["sox_ppmv"],
-        gas_state["nox_ppmv"],
-        gas_state["dust_mg_Nm3"],
-    )
+def normalize_fixed_input(fixed_input: dict[str, float]) -> dict[str, float]:
+    normalized = dict(fixed_input)
+    missing_gas_cols = [col for col in GAS_STATE_COLS if col not in normalized]
+    if missing_gas_cols:
+        raise ValueError(f"Missing fixed-input gas-state columns: {missing_gas_cols}")
+
+    needs_factor_fill = any(col not in normalized or pd.isna(normalized[col]) for col in FACTOR_COLS)
+    if needs_factor_fill:
+        normalized.update(
+            compute_pretreatment_factors(
+                normalized["h2o_ppmv"],
+                normalized["sox_ppmv"],
+                normalized["nox_ppmv"],
+                normalized["dust_mg_Nm3"],
+            )
+        )
+
+    missing_after_fill = [col for col in GAS_STATE_COLS + FACTOR_COLS if col not in normalized]
+    if missing_after_fill:
+        raise ValueError(f"Missing fixed-input columns: {missing_after_fill}")
+    return normalized
+
+
+def build_feature_row(decision: dict[str, float], fixed_input: dict[str, float]) -> dict[str, float]:
+    normalized_fixed = normalize_fixed_input(fixed_input)
     return {
         **decision,
-        **gas_state,
-        **factors,
+        **{col: normalized_fixed[col] for col in GAS_STATE_COLS + FACTOR_COLS},
     }
 
 
@@ -169,7 +191,7 @@ class CostConfig:
     recovery_target: float = 0.90
     purity_penalty_weight: float = 200_000.0
     recovery_penalty_weight: float = 250_000.0
-    uncertainty_penalty_weight: float = 50_000.0
+    uncertainty_penalty_weight: float = 0.0
     min_capture_tpy_per_bed: float = 0.10
     vacuum_efficiency: float = 0.65
     blower_efficiency: float = 0.72
@@ -180,11 +202,20 @@ class CostConfig:
 
 
 class PSAEconomicsOptimizer:
-    def __init__(self, train_df: pd.DataFrame, constants: ProcessConstants | None = None, cost: CostConfig | None = None) -> None:
+    def __init__(
+        self,
+        train_df: pd.DataFrame,
+        purity_model_path: Path,
+        recovery_model_path: Path,
+        constants: ProcessConstants | None = None,
+        cost: CostConfig | None = None,
+    ) -> None:
         self.constants = constants or ProcessConstants()
         self.cost = cost or CostConfig()
         self.train_df = self._prepare_training_data(train_df)
-        self.purity_model, self.recovery_model = self._train_surrogate(self.train_df)
+        self.x_scaler, self.purity_y_scaler, self.recovery_y_scaler = self._fit_scalers(self.train_df)
+        self.purity_model = keras.models.load_model(purity_model_path)
+        self.recovery_model = keras.models.load_model(recovery_model_path)
         self.feature_ranges = {
             col: (float(self.train_df[col].min()), float(self.train_df[col].max()))
             for col in FEATURE_COLS
@@ -194,76 +225,69 @@ class PSAEconomicsOptimizer:
     def _prepare_training_data(df: pd.DataFrame) -> pd.DataFrame:
         if "status" in df.columns:
             df = df[df["status"].eq("ok")].copy()
-        else:
+        elif "valid_physics" in df.columns:
             df = df[df["valid_physics"].fillna(False)].copy()
         return df.dropna(subset=FEATURE_COLS + TARGET_COLS).reset_index(drop=True)
 
     @staticmethod
-    def _train_surrogate(train_df: pd.DataFrame) -> tuple[RandomForestRegressor, RandomForestRegressor]:
-        x_train = train_df[FEATURE_COLS]
-        y_train_purity = train_df["CO2_purity"]
-        y_train_recovery = train_df["CO2_recovery"]
+    def _fit_scalers(train_df: pd.DataFrame) -> tuple[StandardScaler, StandardScaler, StandardScaler]:
+        x_scaler = StandardScaler()
+        purity_y_scaler = StandardScaler()
+        recovery_y_scaler = StandardScaler()
 
-        purity_model = RandomForestRegressor(
-            n_estimators=400,
-            max_depth=12,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        )
-        recovery_model = RandomForestRegressor(
-            n_estimators=400,
-            max_depth=12,
-            min_samples_leaf=2,
-            random_state=42,
-            n_jobs=-1,
-        )
-        purity_model.fit(x_train, y_train_purity)
-        recovery_model.fit(x_train, y_train_recovery)
-        return purity_model, recovery_model
+        x_scaler.fit(train_df[FEATURE_COLS].to_numpy(dtype=np.float32))
+        purity_y_scaler.fit(train_df[["CO2_purity"]].to_numpy(dtype=np.float32))
+        recovery_y_scaler.fit(train_df[["CO2_recovery"]].to_numpy(dtype=np.float32))
+        return x_scaler, purity_y_scaler, recovery_y_scaler
 
     def predict_performance(self, feature_df: pd.DataFrame) -> pd.DataFrame:
-        purity_mean, purity_std = self._predict_with_std(self.purity_model, feature_df)
-        recovery_mean, recovery_std = self._predict_with_std(self.recovery_model, feature_df)
+        x_scaled = self.x_scaler.transform(feature_df[FEATURE_COLS].to_numpy(dtype=np.float32)).astype(np.float32)
+
+        purity_scaled = self.purity_model.predict(x_scaled, verbose=0)
+        recovery_scaled = self.recovery_model.predict(x_scaled, verbose=0)
+
+        purity = self.purity_y_scaler.inverse_transform(np.asarray(purity_scaled).reshape(-1, 1)).ravel()
+        recovery = self.recovery_y_scaler.inverse_transform(np.asarray(recovery_scaled).reshape(-1, 1)).ravel()
 
         pred = pd.DataFrame(index=feature_df.index)
-        pred["pred_CO2_purity"] = np.clip(purity_mean, 1e-4, 0.999)
-        pred["pred_CO2_recovery"] = np.clip(recovery_mean, 1e-4, 0.999)
-        pred["pred_CO2_purity_std"] = purity_std
-        pred["pred_CO2_recovery_std"] = recovery_std
+        pred["pred_CO2_purity"] = np.clip(purity, 1e-4, 0.999)
+        pred["pred_CO2_recovery"] = np.clip(recovery, 1e-4, 0.999)
+        pred["pred_CO2_purity_std"] = 0.0
+        pred["pred_CO2_recovery_std"] = 0.0
         return pred
 
-    @staticmethod
-    def _predict_with_std(model: RandomForestRegressor, feature_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-        x = feature_df.to_numpy()
-        tree_preds = np.vstack([est.predict(x) for est in model.estimators_])
-        return tree_preds.mean(axis=0), tree_preds.std(axis=0)
-
-    def evaluate_candidates(self, candidates: pd.DataFrame, gas_state: dict[str, float]) -> pd.DataFrame:
-        feature_rows = [build_feature_row(row._asdict() if hasattr(row, "_asdict") else row.to_dict(), gas_state) for _, row in candidates.iterrows()]
+    def evaluate_candidates(self, candidates: pd.DataFrame, fixed_input: dict[str, float]) -> pd.DataFrame:
+        feature_rows = [
+            build_feature_row(
+                row._asdict() if hasattr(row, "_asdict") else row.to_dict(),
+                fixed_input,
+            )
+            for _, row in candidates.iterrows()
+        ]
         feature_df = pd.DataFrame(feature_rows)[FEATURE_COLS]
         predictions = self.predict_performance(feature_df)
-        metrics = self._compute_economic_metrics(candidates.reset_index(drop=True), gas_state, predictions)
-        return pd.concat([candidates.reset_index(drop=True), feature_df.drop(columns=list(DECISION_BOUNDS.keys()) + GAS_STATE_COLS, errors="ignore"), predictions, metrics], axis=1)
+        metrics = self._compute_economic_metrics(candidates.reset_index(drop=True), fixed_input, predictions)
+        factor_df = feature_df[FACTOR_COLS].reset_index(drop=True)
+        return pd.concat([candidates.reset_index(drop=True), factor_df, predictions, metrics], axis=1)
 
-    def _compute_economic_metrics(self, candidates: pd.DataFrame, gas_state: dict[str, float], predictions: pd.DataFrame) -> pd.DataFrame:
+    def _compute_economic_metrics(
+        self,
+        candidates: pd.DataFrame,
+        fixed_input: dict[str, float],
+        predictions: pd.DataFrame,
+    ) -> pd.DataFrame:
+        fixed = normalize_fixed_input(fixed_input)
         y_co2, y_n2 = compute_effective_feed_fractions(
-            gas_state["co2_mol_frac"],
-            gas_state["h2o_ppmv"],
-            gas_state["sox_ppmv"],
-            gas_state["nox_ppmv"],
-        )
-        factors = compute_pretreatment_factors(
-            gas_state["h2o_ppmv"],
-            gas_state["sox_ppmv"],
-            gas_state["nox_ppmv"],
-            gas_state["dust_mg_Nm3"],
+            fixed["co2_mol_frac"],
+            fixed["h2o_ppmv"],
+            fixed["sox_ppmv"],
+            fixed["nox_ppmv"],
         )
 
         feed = self._feed_moles(candidates, y_co2, y_n2)
         cycle = self._cycle_times(candidates)
         product = self._product_moles(feed, predictions)
-        energy = self._energy_cost(candidates, gas_state, product)
+        energy = self._energy_cost(candidates, fixed, product)
         bed_volume_m3 = self.constants.bed_length_m * self.constants.area_m2
 
         co2_product_kg = product["n_co2_product_mol"] * CO2_MW_KG_PER_MOL
@@ -278,13 +302,16 @@ class PSAEconomicsOptimizer:
         adsorbent_cost = (
             self.cost.annual_adsorbent_budget_per_m3_bed
             * bed_volume_m3
-            * (0.35 + 1.30 * factors["deactivation_index"])
+            * (0.35 + 1.30 * fixed["deactivation_index"])
             / annual_capture_t_per_bed
         )
 
-        unrecovered_t = np.maximum((feed["n_co2_feed_mol"] - product["n_co2_product_mol"]) * CO2_MW_KG_PER_MOL / 1000.0, 0.0)
+        unrecovered_t = np.maximum(
+            (feed["n_co2_feed_mol"] - product["n_co2_product_mol"]) * CO2_MW_KG_PER_MOL / 1000.0,
+            0.0,
+        )
         unrecovered_cost = self.cost.carbon_price_per_tco2 * unrecovered_t / co2_product_t
-        credit = self.cost.co2_credit_per_tco2 * co2_product_t / co2_product_t
+        credit = self.cost.co2_credit_per_tco2
 
         purity_shortfall = np.maximum(self.cost.purity_target - predictions["pred_CO2_purity"].to_numpy(), 0.0)
         recovery_shortfall = np.maximum(self.cost.recovery_target - predictions["pred_CO2_recovery"].to_numpy(), 0.0)
@@ -308,7 +335,7 @@ class PSAEconomicsOptimizer:
             - credit
         )
 
-        metrics = pd.DataFrame({
+        return pd.DataFrame({
             "cycle_time_s": cycle["cycle_time_s"],
             "n_CO2_feed_calc": feed["n_co2_feed_mol"],
             "n_N2_feed_calc": feed["n_n2_feed_mol"],
@@ -331,10 +358,9 @@ class PSAEconomicsOptimizer:
             "domain_penalty_per_tco2": domain_penalty,
             "total_cost_per_tco2": total_cost,
         })
-        return metrics
 
     def _domain_distance(self, candidates: pd.DataFrame) -> np.ndarray:
-        feature_rows = candidates[["tADS", "PL", "v0", "t_press", "t_depress"]].copy()
+        feature_rows = candidates[DECISION_COLS].copy()
         distances = np.zeros(len(feature_rows))
         for col in DECISION_BOUNDS:
             train_low, train_high = self.feature_ranges[col]
@@ -373,7 +399,12 @@ class PSAEconomicsOptimizer:
             "n_n2_product_mol": n_n2_product,
         }
 
-    def _energy_cost(self, candidates: pd.DataFrame, gas_state: dict[str, float], product: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    def _energy_cost(
+        self,
+        candidates: pd.DataFrame,
+        fixed_input: dict[str, float],
+        product: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
         total_product_mol = product["n_co2_product_mol"] + product["n_n2_product_mol"]
         vacuum_energy = self._isentropic_energy_kwh(
             n_mol=total_product_mol,
@@ -381,7 +412,7 @@ class PSAEconomicsOptimizer:
             p_out_bar=self.cost.vacuum_discharge_bar,
             efficiency=self.cost.vacuum_efficiency,
         )
-        blower_energy = self._blower_energy_kwh(candidates, gas_state)
+        blower_energy = self._blower_energy_kwh(candidates, fixed_input)
         compression_energy = self._isentropic_energy_kwh(
             n_mol=total_product_mol,
             p_in_bar=np.full(len(candidates), self.cost.vacuum_discharge_bar),
@@ -399,12 +430,13 @@ class PSAEconomicsOptimizer:
             "specific_energy_cost_per_tco2": specific_energy * self.cost.electricity_cost_per_kwh,
         }
 
-    def _blower_energy_kwh(self, candidates: pd.DataFrame, gas_state: dict[str, float]) -> np.ndarray:
+    def _blower_energy_kwh(self, candidates: pd.DataFrame, fixed_input: dict[str, float]) -> np.ndarray:
+        fixed = normalize_fixed_input(fixed_input)
         y_co2, y_n2 = compute_effective_feed_fractions(
-            gas_state["co2_mol_frac"],
-            gas_state["h2o_ppmv"],
-            gas_state["sox_ppmv"],
-            gas_state["nox_ppmv"],
+            fixed["co2_mol_frac"],
+            fixed["h2o_ppmv"],
+            fixed["sox_ppmv"],
+            fixed["nox_ppmv"],
         )
         mw_mix = y_co2 * CO2_MW_KG_PER_MOL + y_n2 * N2_MW_KG_PER_MOL
         rho = self.constants.high_pressure_bar * 1e5 * mw_mix / (R * self.constants.temperature_k)
@@ -420,28 +452,35 @@ class PSAEconomicsOptimizer:
         work_j = q_feed * delta_p * candidates["tADS"].to_numpy() / self.cost.blower_efficiency
         return work_j / 3.6e6
 
-    def _isentropic_energy_kwh(self, n_mol: np.ndarray, p_in_bar: np.ndarray, p_out_bar: float, efficiency: float) -> np.ndarray:
+    def _isentropic_energy_kwh(
+        self,
+        n_mol: np.ndarray,
+        p_in_bar: np.ndarray,
+        p_out_bar: float,
+        efficiency: float,
+    ) -> np.ndarray:
         gamma = self.cost.gas_gamma
         pressure_ratio = np.maximum(p_out_bar / np.maximum(p_in_bar, 1e-8), 1.0)
         factor = gamma / (gamma - 1.0) * (pressure_ratio ** ((gamma - 1.0) / gamma) - 1.0)
         work_j = n_mol * R * self.constants.temperature_k * factor / max(efficiency, 1e-6)
         return work_j / 3.6e6
 
-    def optimize_for_gas_state(
+    def optimize_for_fixed_input(
         self,
-        gas_state: dict[str, float],
+        fixed_input: dict[str, float],
         n_samples: int = 4000,
         local_steps: int = 6,
         elite_size: int = 12,
         seed: int = 42,
     ) -> tuple[pd.Series, pd.DataFrame]:
+        normalized_fixed = normalize_fixed_input(fixed_input)
         candidates = lhs_sampling(DECISION_BOUNDS, n_samples=n_samples, seed=seed)
-        evaluated = self.evaluate_candidates(candidates, gas_state)
+        evaluated = self.evaluate_candidates(candidates, normalized_fixed)
 
         bounds_span = {k: v[1] - v[0] for k, v in DECISION_BOUNDS.items()}
         rng = np.random.default_rng(seed + 1000)
         for step in range(local_steps):
-            elite = evaluated.nsmallest(elite_size, "total_cost_per_tco2")[list(DECISION_BOUNDS.keys())]
+            elite = evaluated.nsmallest(elite_size, "total_cost_per_tco2")[DECISION_COLS]
             radius_scale = 0.25 / (step + 1.0)
             local_candidates: list[dict[str, float]] = []
             for _, row in elite.iterrows():
@@ -452,7 +491,7 @@ class PSAEconomicsOptimizer:
                         trial[key] = clip(float(row[key] + noise), low, high)
                     local_candidates.append(trial)
             local_df = pd.DataFrame(local_candidates)
-            local_eval = self.evaluate_candidates(local_df, gas_state)
+            local_eval = self.evaluate_candidates(local_df, normalized_fixed)
             evaluated = pd.concat([evaluated, local_eval], ignore_index=True)
 
         best = evaluated.nsmallest(1, "total_cost_per_tco2").iloc[0]
@@ -463,22 +502,29 @@ def load_training_data(train_csv: Path) -> pd.DataFrame:
     return pd.read_csv(train_csv)
 
 
-def load_gas_states(gas_states_csv: Path | None, fallback_df: pd.DataFrame) -> pd.DataFrame:
-    if gas_states_csv is not None:
-        gas_states = pd.read_csv(gas_states_csv)
-        missing = [col for col in GAS_STATE_COLS if col not in gas_states.columns]
-        if missing:
-            raise ValueError(f"Missing gas-state columns: {missing}")
-        return gas_states[GAS_STATE_COLS].copy()
+def load_fixed_inputs(fixed_inputs_csv: Path | None, fallback_df: pd.DataFrame) -> pd.DataFrame:
+    required_or_derivable = GAS_STATE_COLS + FACTOR_COLS
 
-    dedup = fallback_df[GAS_STATE_COLS].drop_duplicates().head(5).reset_index(drop=True)
-    return dedup
+    if fixed_inputs_csv is not None:
+        fixed_inputs = pd.read_csv(fixed_inputs_csv)
+        missing_gas = [col for col in GAS_STATE_COLS if col not in fixed_inputs.columns]
+        if missing_gas:
+            raise ValueError(f"Missing fixed-input gas-state columns: {missing_gas}")
+        for col in FACTOR_COLS:
+            if col not in fixed_inputs.columns:
+                fixed_inputs[col] = np.nan
+        records = [normalize_fixed_input(row.to_dict()) for _, row in fixed_inputs.iterrows()]
+        return pd.DataFrame(records)[required_or_derivable]
+
+    dedup = fallback_df[required_or_derivable].drop_duplicates().head(5).reset_index(drop=True)
+    records = [normalize_fixed_input(row.to_dict()) for _, row in dedup.iterrows()]
+    return pd.DataFrame(records)[required_or_derivable]
 
 
-def summarize_result(gas_state_id: int, gas_state: pd.Series, best: pd.Series) -> dict[str, float | int | str]:
+def summarize_result(case_id: int, fixed_input: pd.Series, best: pd.Series) -> dict[str, float | int]:
     summary = {
-        "gas_state_id": gas_state_id,
-        **gas_state.to_dict(),
+        "case_id": case_id,
+        **fixed_input.to_dict(),
         "opt_tADS": best["tADS"],
         "opt_PL": best["PL"],
         "opt_v0": best["v0"],
@@ -499,11 +545,13 @@ def summarize_result(gas_state_id: int, gas_state: pd.Series, best: pd.Series) -
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Surrogate-based techno-economic optimization for PSA/VSA operation.")
-    parser.add_argument("--train-csv", type=Path, default=Path("model/output.csv"))
-    parser.add_argument("--gas-states-csv", type=Path, default=None)
-    parser.add_argument("--results-csv", type=Path, default=Path("model/optimization_results.csv"))
-    parser.add_argument("--all-candidates-csv", type=Path, default=Path("model/optimization_candidates.csv"))
+    parser = argparse.ArgumentParser(description="DNN-surrogate techno-economic optimization for PSA/VSA operation.")
+    parser.add_argument("--train-csv", type=Path, default=Path("../model/output.csv"))
+    parser.add_argument("--fixed-inputs-csv", type=Path, default=None)
+    parser.add_argument("--purity-model", type=Path, default=Path("../model/CO2_purity_dnn.keras"))
+    parser.add_argument("--recovery-model", type=Path, default=Path("../model/CO2_recovery_dnn.keras"))
+    parser.add_argument("--results-csv", type=Path, default=Path("../model/optimization_results.csv"))
+    parser.add_argument("--all-candidates-csv", type=Path, default=Path("../model/optimization_candidates.csv"))
     parser.add_argument("--n-samples", type=int, default=4000)
     parser.add_argument("--local-steps", type=int, default=6)
     parser.add_argument("--elite-size", type=int, default=12)
@@ -514,24 +562,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     train_df = load_training_data(args.train_csv)
-    optimizer = PSAEconomicsOptimizer(train_df)
-    gas_states = load_gas_states(args.gas_states_csv, optimizer.train_df)
+    optimizer = PSAEconomicsOptimizer(
+        train_df=train_df,
+        purity_model_path=args.purity_model,
+        recovery_model_path=args.recovery_model,
+    )
+    fixed_inputs = load_fixed_inputs(args.fixed_inputs_csv, optimizer.train_df)
 
-    result_rows: list[dict[str, float | int | str]] = []
+    result_rows: list[dict[str, float | int]] = []
     candidate_frames: list[pd.DataFrame] = []
-    for gas_state_id, gas_state in gas_states.iterrows():
-        best, evaluated = optimizer.optimize_for_gas_state(
-            gas_state=gas_state.to_dict(),
+    for case_id, fixed_input in fixed_inputs.iterrows():
+        best, evaluated = optimizer.optimize_for_fixed_input(
+            fixed_input=fixed_input.to_dict(),
             n_samples=args.n_samples,
             local_steps=args.local_steps,
             elite_size=args.elite_size,
-            seed=args.seed + gas_state_id,
+            seed=args.seed + case_id,
         )
-        result_rows.append(summarize_result(gas_state_id + 1, gas_state, best))
+        result_rows.append(summarize_result(case_id + 1, fixed_input, best))
         evaluated = evaluated.copy()
-        evaluated.insert(0, "gas_state_id", gas_state_id + 1)
-        for col in GAS_STATE_COLS:
-            evaluated[col] = gas_state[col]
+        evaluated.insert(0, "case_id", case_id + 1)
+        for col in GAS_STATE_COLS + FACTOR_COLS:
+            evaluated[col] = fixed_input[col]
         candidate_frames.append(evaluated)
 
     result_df = pd.DataFrame(result_rows)

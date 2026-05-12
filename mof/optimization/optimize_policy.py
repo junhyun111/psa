@@ -199,6 +199,16 @@ class CostConfig:
     gas_gamma: float = 1.30
     vacuum_discharge_bar: float = 1.01325
     product_compression_outlet_bar: float = 110.0
+    vacuum_efficiency_low_pl: float = 0.20
+    vacuum_efficiency_high_pl: float = 0.40
+    practical_min_low_pressure_bar: float = 0.18
+    vacuum_practicality_penalty_weight: float = 20_000.0
+    max_cycles_per_year_soft: float = 120_000.0
+    valve_cycling_penalty_weight: float = 12_000.0
+    preferred_v0_max: float = 0.024
+    velocity_penalty_weight: float = 10_000.0
+    bound_proximity_margin_frac: float = 0.08
+    bound_proximity_penalty_weight: float = 8_000.0
 
 
 class PSAEconomicsOptimizer:
@@ -321,6 +331,10 @@ class PSAEconomicsOptimizer:
             predictions["pred_CO2_purity_std"].to_numpy() + predictions["pred_CO2_recovery_std"].to_numpy()
         )
         domain_penalty = 50_000.0 * self._domain_distance(candidates)
+        valve_cycling_penalty = self._valve_cycling_penalty(cycle["cycle_time_s"])
+        velocity_penalty = self._velocity_penalty(candidates)
+        vacuum_practicality_penalty = self._vacuum_practicality_penalty(candidates)
+        bound_proximity_penalty = self._bound_proximity_penalty(candidates)
 
         total_cost = (
             energy["specific_energy_cost_per_tco2"]
@@ -332,6 +346,10 @@ class PSAEconomicsOptimizer:
             + recovery_penalty
             + uncertainty_penalty
             + domain_penalty
+            + valve_cycling_penalty
+            + velocity_penalty
+            + vacuum_practicality_penalty
+            + bound_proximity_penalty
             - credit
         )
 
@@ -356,6 +374,10 @@ class PSAEconomicsOptimizer:
             "recovery_penalty_per_tco2": recovery_penalty,
             "uncertainty_penalty_per_tco2": uncertainty_penalty,
             "domain_penalty_per_tco2": domain_penalty,
+            "valve_cycling_penalty_per_tco2": valve_cycling_penalty,
+            "velocity_penalty_per_tco2": velocity_penalty,
+            "vacuum_practicality_penalty_per_tco2": vacuum_practicality_penalty,
+            "bound_proximity_penalty_per_tco2": bound_proximity_penalty,
             "total_cost_per_tco2": total_cost,
         })
 
@@ -406,11 +428,12 @@ class PSAEconomicsOptimizer:
         product: dict[str, np.ndarray],
     ) -> dict[str, np.ndarray]:
         total_product_mol = product["n_co2_product_mol"] + product["n_n2_product_mol"]
+        pl = np.maximum(candidates["PL"].to_numpy(), 1e-6)
         vacuum_energy = self._isentropic_energy_kwh(
             n_mol=total_product_mol,
-            p_in_bar=np.maximum(candidates["PL"].to_numpy(), 1e-6),
+            p_in_bar=pl,
             p_out_bar=self.cost.vacuum_discharge_bar,
-            efficiency=self.cost.vacuum_efficiency,
+            efficiency=self._vacuum_efficiency(pl),
         )
         blower_energy = self._blower_energy_kwh(candidates, fixed_input)
         compression_energy = self._isentropic_energy_kwh(
@@ -457,13 +480,52 @@ class PSAEconomicsOptimizer:
         n_mol: np.ndarray,
         p_in_bar: np.ndarray,
         p_out_bar: float,
-        efficiency: float,
+        efficiency: float | np.ndarray,
     ) -> np.ndarray:
         gamma = self.cost.gas_gamma
         pressure_ratio = np.maximum(p_out_bar / np.maximum(p_in_bar, 1e-8), 1.0)
         factor = gamma / (gamma - 1.0) * (pressure_ratio ** ((gamma - 1.0) / gamma) - 1.0)
-        work_j = n_mol * R * self.constants.temperature_k * factor / max(efficiency, 1e-6)
+        work_j = n_mol * R * self.constants.temperature_k * factor / np.maximum(efficiency, 1e-6)
         return work_j / 3.6e6
+
+    def _vacuum_efficiency(self, pl_bar: np.ndarray) -> np.ndarray:
+        low, high = DECISION_BOUNDS["PL"]
+        normalized = np.clip((pl_bar - low) / max(high - low, 1e-9), 0.0, 1.0)
+        return (
+            self.cost.vacuum_efficiency_low_pl
+            + normalized * (self.cost.vacuum_efficiency_high_pl - self.cost.vacuum_efficiency_low_pl)
+        )
+
+    def _valve_cycling_penalty(self, cycle_time_s: np.ndarray) -> np.ndarray:
+        annual_cycles = self.constants.operating_hours_per_year * 3600.0 / np.maximum(cycle_time_s, 1e-6)
+        excess = np.maximum(annual_cycles - self.cost.max_cycles_per_year_soft, 0.0)
+        return self.cost.valve_cycling_penalty_weight * (excess / self.cost.max_cycles_per_year_soft) ** 2
+
+    def _velocity_penalty(self, candidates: pd.DataFrame) -> np.ndarray:
+        v0 = candidates["v0"].to_numpy()
+        excess = np.maximum(v0 - self.cost.preferred_v0_max, 0.0)
+        scale = max(self.cost.preferred_v0_max, 1e-9)
+        return self.cost.velocity_penalty_weight * (excess / scale) ** 2
+
+    def _vacuum_practicality_penalty(self, candidates: pd.DataFrame) -> np.ndarray:
+        pl = candidates["PL"].to_numpy()
+        shortfall = np.maximum(self.cost.practical_min_low_pressure_bar - pl, 0.0)
+        scale = max(self.cost.practical_min_low_pressure_bar, 1e-9)
+        return self.cost.vacuum_practicality_penalty_weight * (shortfall / scale) ** 2
+
+    def _bound_proximity_penalty(self, candidates: pd.DataFrame) -> np.ndarray:
+        margin_frac = self.cost.bound_proximity_margin_frac
+        if margin_frac <= 0.0:
+            return np.zeros(len(candidates))
+
+        penalty = np.zeros(len(candidates))
+        for col, (low, high) in DECISION_BOUNDS.items():
+            values = candidates[col].to_numpy()
+            span = max(high - low, 1e-9)
+            distance_to_nearest_bound = np.minimum(values - low, high - values) / span
+            shortfall = np.maximum(margin_frac - distance_to_nearest_bound, 0.0)
+            penalty += (shortfall / margin_frac) ** 2
+        return self.cost.bound_proximity_penalty_weight * penalty
 
     def optimize_for_fixed_input(
         self,
@@ -544,6 +606,10 @@ def summarize_result(case_id: int, fixed_input: pd.Series, best: pd.Series) -> d
         "recovery_penalty_per_tco2": best["recovery_penalty_per_tco2"],
         "uncertainty_penalty_per_tco2": best["uncertainty_penalty_per_tco2"],
         "domain_penalty_per_tco2": best["domain_penalty_per_tco2"],
+        "valve_cycling_penalty_per_tco2": best["valve_cycling_penalty_per_tco2"],
+        "velocity_penalty_per_tco2": best["velocity_penalty_per_tco2"],
+        "vacuum_practicality_penalty_per_tco2": best["vacuum_practicality_penalty_per_tco2"],
+        "bound_proximity_penalty_per_tco2": best["bound_proximity_penalty_per_tco2"],
         "total_cost_per_tco2": best["total_cost_per_tco2"],
     }
     return summary

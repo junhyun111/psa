@@ -537,8 +537,13 @@ def summarize_result(case_id: int, fixed_input: pd.Series, best: pd.Series) -> d
         "specific_energy_kwh_per_tco2": best["specific_energy_kwh_per_tco2"],
         "energy_cost_per_tco2": best["energy_cost_per_tco2"],
         "capex_proxy_cost_per_tco2": best["capex_proxy_cost_per_tco2"],
+        "fixed_om_cost_per_tco2": best["fixed_om_cost_per_tco2"],
         "adsorbent_cost_per_tco2": best["adsorbent_cost_per_tco2"],
         "unrecovered_cost_per_tco2": best["unrecovered_cost_per_tco2"],
+        "purity_penalty_per_tco2": best["purity_penalty_per_tco2"],
+        "recovery_penalty_per_tco2": best["recovery_penalty_per_tco2"],
+        "uncertainty_penalty_per_tco2": best["uncertainty_penalty_per_tco2"],
+        "domain_penalty_per_tco2": best["domain_penalty_per_tco2"],
         "total_cost_per_tco2": best["total_cost_per_tco2"],
     }
     return summary
